@@ -65,7 +65,11 @@ export async function buildAndSign(
   const message = messageOrErr as Parameters<
     typeof SanitizedMessageUtil.hash
   >[0];
-  const hash = SanitizedMessageUtil.hash(message);
+  // `hash` may come back as a hex string, number[], or Uint8Array depending
+  // on the SDK build; the signer needs raw 32 bytes.
+  const hash = toBytes(
+    SanitizedMessageUtil.hash(message) as unknown as string | Uint8Array | number[],
+  );
 
   let rawSig: Uint8Array;
   try {

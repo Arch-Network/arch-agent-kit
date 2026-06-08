@@ -1,4 +1,4 @@
-import type { Instruction } from '@saturnbtcio/arch-sdk';
+import type { Instruction } from '@arch-network/arch-sdk';
 import { toHex } from './util';
 
 export class SafetyError extends Error {

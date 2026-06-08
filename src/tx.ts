@@ -4,7 +4,7 @@ import {
   SignatureUtil,
   type Instruction,
   type RuntimeTransaction,
-} from '@saturnbtcio/arch-sdk';
+} from '@arch-network/arch-sdk';
 import type { Signer } from './types';
 import { sleep, toBytes, toHex } from './util';
 

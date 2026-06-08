@@ -1,7 +1,7 @@
 import {
   RpcConnection,
   type Instruction,
-} from '@saturnbtcio/arch-sdk';
+} from '@arch-network/arch-sdk';
 import { TitanHttpClient } from '@titanbtcio/sdk';
 import {
   DRYRUN_TXID,

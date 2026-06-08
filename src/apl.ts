@@ -1,4 +1,4 @@
-import { PubkeyUtil, type Instruction } from '@saturnbtcio/arch-sdk';
+import { PubkeyUtil, type Instruction } from '@arch-network/arch-sdk';
 import { hexToBytes, readU64le } from './util';
 
 /**
@@ -72,6 +72,29 @@ export function createAtaIx(
       { pubkey: id.token, is_signer: false, is_writable: false },
     ],
     data: new Uint8Array(0),
+  };
+}
+
+/** SPL/APL `MintTo { amount }` instruction (instruction index 7). */
+export function mintToIx(
+  mint: Uint8Array,
+  destination: Uint8Array,
+  authority: Uint8Array,
+  amount: bigint,
+  cfg: AplConfig = {},
+): Instruction {
+  const { token } = ids(cfg);
+  const data = new Uint8Array(9);
+  data[0] = 7;
+  new DataView(data.buffer).setBigUint64(1, amount, true);
+  return {
+    program_id: token,
+    accounts: [
+      { pubkey: mint, is_signer: false, is_writable: true },
+      { pubkey: destination, is_signer: false, is_writable: true },
+      { pubkey: authority, is_signer: true, is_writable: false },
+    ],
+    data,
   };
 }
 

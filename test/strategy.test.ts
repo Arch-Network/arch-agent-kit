@@ -242,6 +242,48 @@ describe('describeStrategy', () => {
     );
   });
 
+  // AI-driven arena agents: the mandate (not the MA/indicator or peer-token
+  // trading) drives the on-chain arena, so the prose must say so.
+  it('describes an AI-arena agent by its mandate-driven arena role', () => {
+    const cfg: StrategyConfig = {
+      ...DEFAULT_STRATEGY_CONFIG,
+      asset: 'BTC',
+      direction: 'momentum',
+      indicator: 'ma',
+      arenaSide: 'follow',
+      arenaSizeBps: 1000,
+      llmEnabled: true,
+    };
+    expect(describeStrategy(cfg)).toBe(
+      'AI-driven BTC arena agent — an AI mandate decides when to go long or ' +
+        'short on BTC in the on-chain arena each tick. Sizes ~10% of treasury ' +
+        'per position.',
+    );
+  });
+
+  it('bounds an AI-arena longOnly/shortOnly agent to its side in the prose', () => {
+    const long: StrategyConfig = {
+      ...DEFAULT_STRATEGY_CONFIG,
+      asset: 'ETH',
+      arenaSide: 'longOnly',
+      llmEnabled: true,
+    };
+    expect(describeStrategy(long)).toContain('when to hold a long on ETH');
+    const short: StrategyConfig = { ...long, arenaSide: 'shortOnly' };
+    expect(describeStrategy(short)).toContain('when to hold a short on ETH');
+  });
+
+  it('does not use the AI-arena prose when the arena is off (llm + off)', () => {
+    const cfg: StrategyConfig = {
+      ...DEFAULT_STRATEGY_CONFIG,
+      asset: 'SOL',
+      arenaSide: 'off',
+      llmEnabled: true,
+    };
+    // Falls through to the deterministic signal prose (no arena clause).
+    expect(describeStrategy(cfg)).not.toContain('AI-driven');
+  });
+
   it('names the configured asset/indicator/size, never an unrelated one', () => {
     const cfg: StrategyConfig = {
       ...DEFAULT_STRATEGY_CONFIG,
@@ -269,18 +311,22 @@ describe('describeStrategy', () => {
       for (const indicator of indicators) {
         for (const direction of directions) {
           for (const arenaSide of arenaSides) {
-            const cfg: StrategyConfig = {
-              ...DEFAULT_STRATEGY_CONFIG,
-              asset,
-              indicator,
-              direction,
-              arenaSide,
-              sizeBps: 10_000,
-            };
-            const prose = describeStrategy(cfg);
-            expect(prose.length).toBeGreaterThan(0);
-            const full = prose + encodeStrategyTag(cfg);
-            expect(enc.encode(full).length).toBeLessThanOrEqual(512);
+            for (const llmEnabled of [false, true]) {
+              const cfg: StrategyConfig = {
+                ...DEFAULT_STRATEGY_CONFIG,
+                asset,
+                indicator,
+                direction,
+                arenaSide,
+                sizeBps: 10_000,
+                arenaSizeBps: 10_000,
+                llmEnabled,
+              };
+              const prose = describeStrategy(cfg);
+              expect(prose.length).toBeGreaterThan(0);
+              const full = prose + encodeStrategyTag(cfg);
+              expect(enc.encode(full).length).toBeLessThanOrEqual(512);
+            }
           }
         }
       }

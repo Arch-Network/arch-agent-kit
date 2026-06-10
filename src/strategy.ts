@@ -527,6 +527,17 @@ function arenaClause(side: ArenaSide, direction: StrategyDirection): string {
  * comfortably within the metadata description byte budget.
  */
 export function describeStrategy(cfg: StrategyConfig): string {
+  // AI-driven arena agent: the free-text mandate (not the MA/indicator or any
+  // peer-token trading) is what actually drives the on-chain arena each tick, so
+  // describe it as such instead of the deterministic signal/launchpad prose.
+  if (cfg.llmEnabled && cfg.arenaSide !== 'off') {
+    const decision = aiArenaDecision(cfg.arenaSide, cfg.asset);
+    const size = `Sizes ~${formatSizePct(cfg.arenaSizeBps)}% of treasury per position`;
+    return (
+      `AI-driven ${cfg.asset} arena agent — an AI mandate decides ${decision} ` +
+      `in the on-chain arena each tick. ${size}.`
+    );
+  }
   const lead =
     cfg.direction === 'momentum'
       ? `Rides ${cfg.asset} momentum`
@@ -535,4 +546,19 @@ export function describeStrategy(cfg: StrategyConfig): string {
   const size = `Sizes ~${formatSizePct(cfg.sizeBps)}% per trade`;
   const arena = arenaClause(cfg.arenaSide, cfg.direction);
   return `${lead} — ${signal}. ${size}${arena}.`;
+}
+
+/** The arena decision an AI mandate makes, given the creator's side constraint.
+ *  Mirrors the runtime guardrail (runtime/src/runner.ts `arenaStep`): longOnly/
+ *  shortOnly bound the model to one side; 'follow' lets it pick either. */
+function aiArenaDecision(side: ArenaSide, asset: StrategyAsset): string {
+  switch (side) {
+    case 'longOnly':
+      return `when to hold a long on ${asset}`;
+    case 'shortOnly':
+      return `when to hold a short on ${asset}`;
+    case 'follow':
+    default:
+      return `when to go long or short on ${asset}`;
+  }
 }

@@ -17,6 +17,11 @@
       "types": "./dist/strategy.d.ts",
       "import": "./dist/strategy.js",
       "require": "./dist/strategy.cjs"
+    },
+    "./tournament": {
+      "types": "./dist/tournament.d.ts",
+      "import": "./dist/tournament.js",
+      "require": "./dist/tournament.cjs"
     }
   },
   "files": [
@@ -27,7 +32,7 @@
     "node": ">=20.0.0"
   },
   "scripts": {
-    "build": "tsup src/index.ts src/strategy.ts --format cjs,esm --dts --clean",
+    "build": "tsup src/index.ts src/strategy.ts src/tournament.ts --format cjs,esm --dts --clean",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "test:watch": "vitest"

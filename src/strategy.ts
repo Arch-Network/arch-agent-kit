@@ -38,6 +38,14 @@
 //  38  mandateLen          u16
 //  40  mandate             utf8[mandateLen]
 //
+// v3 (variable header): identical through byte 37, then:
+//  38  holdHorizonSecs     u32  hold duration in seconds (0=use arenaHoldTicks)
+//  42  leverage            u8   1/2/5 (runtime CLAMPS to 1x; forward-compat)
+//  43  portfolioCount      u8   0=single-asset (use `asset`), 1-6=multi-asset
+//  44  portfolioEntries    [assetIndex u8, weightBps u16] × portfolioCount
+//  44+portfolioCount*3     mandateLen  u16
+//  46+portfolioCount*3     mandate     utf8[mandateLen]
+//
 // An empty v2 mandate => 40 bytes total (~56 base64 chars), far under the
 // 512-byte metadata description budget. The config is embedded in the human
 // description as `<prose>\n[s1]<base64>[/s1]` so the prose stays readable and
@@ -45,7 +53,7 @@
 
 export type StrategyAsset = 'BTC' | 'ETH' | 'SOL' | 'XRP' | 'DOGE' | 'AVAX';
 export type StrategyDirection = 'momentum' | 'reversion';
-export type StrategyIndicator = 'ma' | 'breakout' | 'emaCross' | 'rsi';
+export type StrategyIndicator = 'ma' | 'breakout' | 'emaCross' | 'rsi' | 'fib';
 export type ArenaSide = 'follow' | 'longOnly' | 'shortOnly' | 'off';
 
 /** One signal market the agents can read. The Coinbase product is always
@@ -91,6 +99,13 @@ export function isKnownAsset(s: string): s is StrategyAsset {
   return ASSET_TABLE.some((a) => a.ticker === s);
 }
 
+/** One entry in a v3 multi-asset portfolio weight vector. */
+export interface PortfolioEntry {
+  asset: StrategyAsset;
+  /** Fraction of the arena budget allocated to this asset, in bps. */
+  weightBps: number;
+}
+
 export interface StrategyConfig {
   /** Schema version; bump on any layout change so old agents keep decoding. */
   version: number;
@@ -130,9 +145,23 @@ export interface StrategyConfig {
   mandate: string;
   /** Phase 2: opt this agent into LLM decisioning (still gated by a key). */
   llmEnabled: boolean;
+
+  // ── v3 fields ──────────────────────────────────────────────────────────
+
+  /** Hold duration in seconds. 0 = use arenaHoldTicks (v2 backward compat).
+   *  Clamped to MAX_HOLD_HORIZON_SECS (7 days). */
+  holdHorizonSecs: number;
+  /** Leverage tier (1/2/5). Runtime CLAMPS execution to 1x; the field is
+   *  forward-compat for a future on-chain program upgrade (see leverage spec). */
+  leverage: number;
+  /** Multi-asset portfolio weights. Empty array = single-asset mode (the agent
+   *  trades only the `asset` field, preserving v1/v2 behavior). When non-empty,
+   *  each entry's weightBps share of arenaSizeBps is allocated to that asset.
+   *  The on-chain Position-per-(market,owner) already permits concurrent positions. */
+  portfolio: PortfolioEntry[];
 }
 
-export const STRATEGY_VERSION = 2;
+export const STRATEGY_VERSION = 3;
 
 /** Max bps for size/arena/buyback fields (100%). */
 export const STRATEGY_BPS_MAX = 10_000;
@@ -143,9 +172,26 @@ export const MANDATE_MAX_BYTES = 200;
 /** Upper bound for period/window fields (fits a u8; keeps history buffers sane). */
 export const STRATEGY_PERIOD_MAX = 240;
 
+/** Maximum hold horizon: 7 days in seconds. Positions held longer than this are
+ *  force-closed. Capped here to bound funding cost exposure. */
+export const MAX_HOLD_HORIZON_SECS = 7 * 24 * 60 * 60; // 604800
+
+/** Valid leverage tiers. Only 1x is executed; 2x/5x are forward-compat. */
+export const LEVERAGE_TIERS = [1, 2, 5] as const;
+
+/** Maximum assets in a portfolio weight vector (matches the 6-market on-chain set). */
+export const MAX_PORTFOLIO_SIZE = 6;
+
 /** Markers wrapping the base64 config inside the metadata description. */
 export const STRATEGY_TAG_OPEN = '[s1]';
 export const STRATEGY_TAG_CLOSE = '[/s1]';
+
+/** Byte size of the encoded binary (not base64) for a v3 config with a given
+ *  portfolio length and mandate byte length. Used to compute the metadata
+ *  description budget in the wizard. */
+export function encodedByteSize(portfolioCount: number, mandateBytes: number): number {
+  return V3_PREFIX_BYTES + portfolioCount * 3 + 2 + mandateBytes;
+}
 
 // Enum tables are APPEND-ONLY: an index, once shipped, must keep its meaning so
 // already-launched agents decode to the same value. ASSETS is derived from the
@@ -157,6 +203,7 @@ const INDICATORS: readonly StrategyIndicator[] = [
   'breakout',
   'emaCross',
   'rsi',
+  'fib',
 ];
 const ARENA_SIDES: readonly ArenaSide[] = [
   'follow',
@@ -167,8 +214,10 @@ const ARENA_SIDES: readonly ArenaSide[] = [
 
 /** v1 fixed header size; v1 agents still decode at this layout. */
 const V1_HEADER_BYTES = 34;
-/** v2 fixed header size (v1 + six u8 style fields). Current encode size. */
+/** v2 fixed header size (v1 + six u8 style fields). */
 const V2_HEADER_BYTES = 40;
+/** v3 fixed prefix size (v2 + u32 holdHorizonSecs + u8 leverage + u8 portfolioCount). */
+const V3_PREFIX_BYTES = 44;
 
 /** Sensible defaults that mirror the legacy hash-derived archetype behavior.
  *  The v2 style fields default so an untouched config trades like a v1 agent
@@ -195,6 +244,9 @@ export const DEFAULT_STRATEGY_CONFIG: StrategyConfig = {
   rsiOverbought: 70,
   mandate: '',
   llmEnabled: false,
+  holdHorizonSecs: 0,
+  leverage: 1,
+  portfolio: [],
 };
 
 /** Defaults for the v2 style fields, applied when decoding a v1 agent. */
@@ -205,6 +257,13 @@ const V1_STYLE_DEFAULTS = {
   rsiPeriod: DEFAULT_STRATEGY_CONFIG.rsiPeriod,
   rsiOversold: DEFAULT_STRATEGY_CONFIG.rsiOversold,
   rsiOverbought: DEFAULT_STRATEGY_CONFIG.rsiOverbought,
+} as const;
+
+/** Defaults for the v3 fields, applied when decoding a v1 or v2 agent. */
+const V3_FIELD_DEFAULTS = {
+  holdHorizonSecs: DEFAULT_STRATEGY_CONFIG.holdHorizonSecs,
+  leverage: DEFAULT_STRATEGY_CONFIG.leverage,
+  portfolio: DEFAULT_STRATEGY_CONFIG.portfolio,
 } as const;
 
 const textEncoder = new TextEncoder();
@@ -246,8 +305,17 @@ export function encodeStrategy(cfg: StrategyConfig): Uint8Array {
       `mandate too long: ${mandateBytes.length} > ${MANDATE_MAX_BYTES} bytes`,
     );
   }
-  const out = new Uint8Array(V2_HEADER_BYTES + mandateBytes.length);
+  const portfolio = cfg.portfolio ?? [];
+  if (portfolio.length > MAX_PORTFOLIO_SIZE) {
+    throw new Error(
+      `portfolio too large: ${portfolio.length} > ${MAX_PORTFOLIO_SIZE}`,
+    );
+  }
+  const portfolioBytes = portfolio.length * 3;
+  const totalSize = V3_PREFIX_BYTES + portfolioBytes + 2 + mandateBytes.length;
+  const out = new Uint8Array(totalSize);
   const view = new DataView(out.buffer);
+  // Bytes 0-37: identical across v1/v2/v3.
   out[0] = STRATEGY_VERSION;
   out[1] = enumIndex(ASSETS, cfg.asset, 'asset');
   out[2] = enumIndex(DIRECTIONS, cfg.direction, 'direction');
@@ -269,39 +337,43 @@ export function encodeStrategy(cfg: StrategyConfig): Uint8Array {
   out[35] = clampInt(cfg.rsiPeriod, 0xff);
   out[36] = clampInt(cfg.rsiOversold, 0xff);
   out[37] = clampInt(cfg.rsiOverbought, 0xff);
-  view.setUint16(38, mandateBytes.length, true);
-  out.set(mandateBytes, V2_HEADER_BYTES);
+  // v3 fields.
+  view.setUint32(38, clampInt(cfg.holdHorizonSecs ?? 0, MAX_HOLD_HORIZON_SECS), true);
+  out[42] = clampLeverage(cfg.leverage ?? 1);
+  out[43] = portfolio.length;
+  let off = V3_PREFIX_BYTES;
+  for (const entry of portfolio) {
+    out[off] = enumIndex(ASSETS, entry.asset, 'portfolio asset');
+    view.setUint16(off + 1, clampInt(entry.weightBps, 0xffff), true);
+    off += 3;
+  }
+  view.setUint16(off, mandateBytes.length, true);
+  out.set(mandateBytes, off + 2);
   return out;
 }
 
-/** Decode binary into a config. Decodes both v1 (legacy 34-byte header,
- *  defaulting the v2 style fields) and v2. Throws on a bad version, truncation,
- *  or an unknown enum so callers can fall back to a safe default. */
+function clampLeverage(n: number): number {
+  if (n === 5) return 5;
+  if (n === 2) return 2;
+  return 1;
+}
+
+/** Decode binary into a config. Decodes v1 (legacy 34-byte header), v2
+ *  (40-byte header), and v3 (variable header with hold horizon + leverage +
+ *  portfolio). Older versions get the newer fields defaulted so they trade
+ *  exactly as before. Throws on a bad version, truncation, or an unknown enum
+ *  so callers can fall back to a safe default. */
 export function decodeStrategy(bytes: Uint8Array): StrategyConfig {
   if (bytes.length < V1_HEADER_BYTES) {
     throw new Error('strategy bytes truncated');
   }
   const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
   const version = bytes[0]!;
-  if (version !== 1 && version !== 2) {
+  if (version !== 1 && version !== 2 && version !== 3) {
     throw new Error(`unsupported strategy version ${version}`);
   }
 
-  // Bytes 0..31 are shared across versions; only the trailing fields move.
-  const headerBytes = version === 1 ? V1_HEADER_BYTES : V2_HEADER_BYTES;
-  const mandateLenOff = version === 1 ? 32 : 38;
-  const mandateLen = view.getUint16(mandateLenOff, true);
-  if (mandateLen > MANDATE_MAX_BYTES) {
-    throw new Error(`strategy mandate length ${mandateLen} exceeds cap`);
-  }
-  if (bytes.length < headerBytes + mandateLen) {
-    throw new Error('strategy mandate truncated');
-  }
-  const mandate = textDecoder.decode(
-    bytes.slice(headerBytes, headerBytes + mandateLen),
-  );
-
-  // v1 agents carry no style fields; default them so they trade as before.
+  // v2 style fields (bytes 32-37): v1 defaults them, v2+ reads them.
   const style =
     version === 1
       ? { ...V1_STYLE_DEFAULTS }
@@ -313,6 +385,53 @@ export function decodeStrategy(bytes: Uint8Array): StrategyConfig {
           rsiOversold: bytes[36]!,
           rsiOverbought: bytes[37]!,
         };
+
+  // v3 fields: hold horizon, leverage, portfolio. v1/v2 default them.
+  let v3Fields: { holdHorizonSecs: number; leverage: number; portfolio: PortfolioEntry[] };
+  let mandateLenOff: number;
+  let headerBytes: number;
+
+  if (version <= 2) {
+    v3Fields = { ...V3_FIELD_DEFAULTS };
+    mandateLenOff = version === 1 ? 32 : 38;
+    headerBytes = version === 1 ? V1_HEADER_BYTES : V2_HEADER_BYTES;
+  } else {
+    if (bytes.length < V3_PREFIX_BYTES) {
+      throw new Error('strategy v3 bytes truncated');
+    }
+    const holdHorizonSecs = view.getUint32(38, true);
+    const leverage = bytes[42]!;
+    const portfolioCount = bytes[43]!;
+    if (portfolioCount > MAX_PORTFOLIO_SIZE) {
+      throw new Error(`strategy portfolio count ${portfolioCount} exceeds max`);
+    }
+    const portfolioEnd = V3_PREFIX_BYTES + portfolioCount * 3;
+    if (bytes.length < portfolioEnd + 2) {
+      throw new Error('strategy v3 portfolio truncated');
+    }
+    const portfolio: PortfolioEntry[] = [];
+    for (let i = 0; i < portfolioCount; i++) {
+      const off = V3_PREFIX_BYTES + i * 3;
+      portfolio.push({
+        asset: enumValue(ASSETS, bytes[off]!, 'portfolio asset'),
+        weightBps: view.getUint16(off + 1, true),
+      });
+    }
+    v3Fields = { holdHorizonSecs, leverage, portfolio };
+    mandateLenOff = portfolioEnd;
+    headerBytes = portfolioEnd + 2;
+  }
+
+  const mandateLen = view.getUint16(mandateLenOff, true);
+  if (mandateLen > MANDATE_MAX_BYTES) {
+    throw new Error(`strategy mandate length ${mandateLen} exceeds cap`);
+  }
+  if (bytes.length < headerBytes + mandateLen) {
+    throw new Error('strategy mandate truncated');
+  }
+  const mandate = textDecoder.decode(
+    bytes.slice(headerBytes, headerBytes + mandateLen),
+  );
 
   return {
     version,
@@ -331,6 +450,7 @@ export function decodeStrategy(bytes: Uint8Array): StrategyConfig {
     ...style,
     llmEnabled: bytes[31] === 1,
     mandate,
+    ...v3Fields,
   };
 }
 
@@ -436,6 +556,14 @@ export function clampStrategy(
   const d = DEFAULT_STRATEGY_CONFIG;
   const rsiOversold = clampRange(cfg.rsiOversold, 1, 99, d.rsiOversold);
   const rsiOverbought = clampRange(cfg.rsiOverbought, 1, 99, d.rsiOverbought);
+  const holdHorizonSecs = clampInt(cfg.holdHorizonSecs ?? 0, MAX_HOLD_HORIZON_SECS);
+  const leverage = clampLeverage(cfg.leverage ?? 1);
+  const portfolio = (cfg.portfolio ?? [])
+    .slice(0, MAX_PORTFOLIO_SIZE)
+    .map((e) => ({
+      asset: ASSETS.includes(e.asset) ? e.asset : ASSETS[0]!,
+      weightBps: clampInt(e.weightBps, STRATEGY_BPS_MAX),
+    }));
   return {
     ...cfg,
     sizeBps: clampInt(cfg.sizeBps, STRATEGY_BPS_MAX),
@@ -451,12 +579,164 @@ export function clampStrategy(
     rsiOversold: Math.min(rsiOversold, rsiOverbought),
     rsiOverbought: Math.max(rsiOversold, rsiOverbought),
     mandate: sanitizeMandate(cfg.mandate),
+    holdHorizonSecs,
+    leverage,
+    portfolio,
   };
 }
 
 /** Short display label for a config (used where there's no archetype label). */
 export function strategyLabel(cfg: StrategyConfig): string {
-  return `${cfg.asset} ${cfg.direction}`;
+  const assets =
+    cfg.portfolio.length > 0
+      ? cfg.portfolio.map((e) => e.asset).join('/')
+      : cfg.asset;
+  const horizon = horizonLabel(cfg);
+  return horizon ? `${assets} ${cfg.direction} (${horizon})` : `${assets} ${cfg.direction}`;
+}
+
+/** Human-readable horizon class for a config. */
+export function horizonLabel(cfg: StrategyConfig): string {
+  const secs = effectiveHoldSecs(cfg);
+  if (secs <= 600) return 'scalper';
+  if (secs <= 86_400) return 'swing';
+  return 'position';
+}
+
+/** Effective hold duration in seconds, reconciling holdHorizonSecs with the
+ *  legacy arenaHoldTicks (at 60s/tick). v1/v2 agents with holdHorizonSecs=0
+ *  fall through to arenaHoldTicks. */
+export function effectiveHoldSecs(cfg: StrategyConfig, tickIntervalSecs = 60): number {
+  if (cfg.holdHorizonSecs > 0) return cfg.holdHorizonSecs;
+  return (cfg.arenaHoldTicks || 3) * tickIntervalSecs;
+}
+
+/** Expected round-trip arena cost for one position at a given hold horizon.
+ *  Open+close fee = 20 bps total. Funding = 1 bps/hr. */
+export function estimatedRoundTripCostBps(holdSecs: number): number {
+  const feeBps = 20;
+  const fundingBps = (holdSecs / 3600) * 1;
+  return Math.round(feeBps + fundingBps);
+}
+
+// ───────────────────────── Signal evaluation (shared) ─────────────────────────
+// The ONE implementation of indicator + direction → buy/not-buy, used by the
+// runtime's live signal engine (runtime/src/strategy/signal.ts) and the app's
+// wizard simulator, so what the preview shows is exactly what the agent runs.
+
+function seriesMean(series: number[]): number {
+  if (series.length === 0) return 0;
+  return series.reduce((a, b) => a + b, 0) / series.length;
+}
+
+/** Exponential moving average over the whole series (seeded at the first point). */
+function seriesEma(series: number[], period: number): number {
+  if (series.length === 0) return 0;
+  const k = 2 / (Math.max(period, 1) + 1);
+  let e = series[0]!;
+  for (let i = 1; i < series.length; i++) e = series[i]! * k + e * (1 - k);
+  return e;
+}
+
+/** Wilder-style RSI over the last `period` deltas; 50 when undefined. */
+function seriesRsi(series: number[], period: number): number {
+  if (series.length < 2) return 50;
+  const n = Math.min(Math.max(period, 1), series.length - 1);
+  let gains = 0;
+  let losses = 0;
+  for (let i = series.length - n; i < series.length; i++) {
+    const d = series[i]! - series[i - 1]!;
+    if (d >= 0) gains += d;
+    else losses -= d;
+  }
+  if (gains + losses === 0) return 50;
+  const rs = gains / (losses || 1e-9);
+  return 100 - 100 / (1 + rs);
+}
+
+/** One signal verdict: buy (or risk-off when false) plus the reference level
+ *  used in human-readable trade reasons. */
+export interface SignalVerdict {
+  buy: boolean;
+  ref: number;
+}
+
+/**
+ * Collapse the configured indicator + direction into one buy/not-buy signal.
+ * `history` is the price series INCLUDING the current price as its last
+ * element. Semantics per indicator:
+ *
+ * - ma:       spot vs the lookback moving average.
+ * - breakout: new lookback highs/lows (holds to the MA in between).
+ * - emaCross: fast EMA above/below slow EMA (whole history).
+ * - rsi:      momentum buys strength (RSI>50); reversion buys oversold dips
+ *             (RSI<rsiOversold) — an asymmetric band, not a plain sign flip.
+ * - fib:      golden-ratio bands of the lookback swing. Momentum buys while
+ *             price holds the upper zone (above the 61.8% level); reversion
+ *             buys the discount zone (below the 38.2% level). A flat swing
+ *             falls back to the MA.
+ *
+ * For ma/breakout/emaCross, reversion is the mirror of momentum (buy weakness
+ * instead of strength).
+ */
+export function evaluateSignal(
+  history: number[],
+  config: Pick<
+    StrategyConfig,
+    | 'direction'
+    | 'indicator'
+    | 'lookback'
+    | 'maFast'
+    | 'maSlow'
+    | 'rsiPeriod'
+    | 'rsiOversold'
+  >,
+): SignalVerdict {
+  const price = history[history.length - 1] ?? 0;
+  const momentum = config.direction === 'momentum';
+  const flip = (rising: boolean) => (momentum ? rising : !rising);
+  const window = history.slice(-config.lookback);
+
+  switch (config.indicator) {
+    case 'breakout': {
+      const prior = window.slice(0, -1);
+      const hi = prior.length ? Math.max(...prior) : price;
+      const lo = prior.length ? Math.min(...prior) : price;
+      if (price >= hi) return { buy: flip(true), ref: hi };
+      if (price <= lo) return { buy: flip(false), ref: lo };
+      const ma = seriesMean(window);
+      return { buy: flip(price > ma), ref: ma };
+    }
+    case 'emaCross': {
+      const fast = seriesEma(history, config.maFast);
+      const slow = seriesEma(history, config.maSlow);
+      return { buy: flip(fast > slow), ref: slow };
+    }
+    case 'rsi': {
+      const r = seriesRsi(history, config.rsiPeriod);
+      const buy = momentum ? r > 50 : r < config.rsiOversold;
+      return { buy, ref: r };
+    }
+    case 'fib': {
+      const hi = Math.max(...window);
+      const lo = Math.min(...window);
+      const range = hi - lo;
+      if (range <= 0) {
+        const ma = seriesMean(window);
+        return { buy: flip(price > ma), ref: ma };
+      }
+      const level618 = lo + range * 0.618;
+      const level382 = lo + range * 0.382;
+      return momentum
+        ? { buy: price >= level618, ref: level618 }
+        : { buy: price <= level382, ref: level382 };
+    }
+    case 'ma':
+    default: {
+      const ma = seriesMean(window);
+      return { buy: flip(price > ma), ref: ma };
+    }
+  }
 }
 
 /** Format a bps size as a percent, trimming a trailing `.0` (2500 -> "25"). */
@@ -470,7 +750,8 @@ function formatSizePct(bps: number): string {
  * runtime signal engine actually does (runtime/src/strategy/signal.ts
  * `evaluate`): momentum buys strength, reversion fades extremes; breakout acts
  * on new highs/lows, emaCross on the fast/slow EMA cross, rsi on the RSI band,
- * ma on price vs the recent moving average.
+ * fib on the golden-ratio bands of the recent swing, ma on price vs the recent
+ * moving average.
  */
 function signalSentence(
   asset: StrategyAsset,
@@ -491,6 +772,10 @@ function signalSentence(
       return momentum
         ? `buys ${asset} strength when RSI runs above 50 and trims as momentum fades`
         : `buys when ${asset} is oversold and trims into overbought rallies`;
+    case 'fib':
+      return momentum
+        ? `buys when ${asset} holds the upper golden-ratio zone (above the 61.8% level) of its recent swing and trims when the level is lost`
+        : `buys when ${asset} retraces into the lower golden-ratio zone (below the 38.2% level) of its recent swing and trims as it climbs back`;
     case 'ma':
     default:
       return momentum
@@ -527,38 +812,50 @@ function arenaClause(side: ArenaSide, direction: StrategyDirection): string {
  * comfortably within the metadata description byte budget.
  */
 export function describeStrategy(cfg: StrategyConfig): string {
+  const assetDisplay = cfg.portfolio.length > 0
+    ? cfg.portfolio.map((e) => e.asset).join('/')
+    : cfg.asset;
+  const horizon = horizonSuffix(cfg);
   // AI-driven arena agent: the free-text mandate (not the MA/indicator or any
   // peer-token trading) is what actually drives the on-chain arena each tick, so
   // describe it as such instead of the deterministic signal/launchpad prose.
   if (cfg.llmEnabled && cfg.arenaSide !== 'off') {
-    const decision = aiArenaDecision(cfg.arenaSide, cfg.asset);
+    const decision = aiArenaDecision(cfg.arenaSide, assetDisplay);
     const size = `Sizes ~${formatSizePct(cfg.arenaSizeBps)}% of treasury per position`;
     return (
-      `AI-driven ${cfg.asset} arena agent — an AI mandate decides ${decision} ` +
-      `in the on-chain arena each tick. ${size}.`
+      `AI-driven ${assetDisplay} arena agent — an AI mandate decides ${decision} ` +
+      `in the on-chain arena each tick. ${size}.${horizon}`
     );
   }
   const lead =
     cfg.direction === 'momentum'
-      ? `Rides ${cfg.asset} momentum`
-      : `Fades ${cfg.asset} extremes`;
+      ? `Rides ${assetDisplay} momentum`
+      : `Fades ${assetDisplay} extremes`;
   const signal = signalSentence(cfg.asset, cfg.direction, cfg.indicator);
   const size = `Sizes ~${formatSizePct(cfg.sizeBps)}% per trade`;
   const arena = arenaClause(cfg.arenaSide, cfg.direction);
-  return `${lead} — ${signal}. ${size}${arena}.`;
+  return `${lead} — ${signal}. ${size}${arena}.${horizon}`;
+}
+
+function horizonSuffix(cfg: StrategyConfig): string {
+  const secs = effectiveHoldSecs(cfg);
+  if (secs <= 600) return '';
+  const label = secs <= 86_400 ? 'Swing' : 'Position';
+  const dur = secs < 3600 ? `${Math.round(secs / 60)}m` : `${Math.round(secs / 3600)}h`;
+  return ` ${label} horizon (~${dur} holds).`;
 }
 
 /** The arena decision an AI mandate makes, given the creator's side constraint.
  *  Mirrors the runtime guardrail (runtime/src/runner.ts `arenaStep`): longOnly/
  *  shortOnly bound the model to one side; 'follow' lets it pick either. */
-function aiArenaDecision(side: ArenaSide, asset: StrategyAsset): string {
+function aiArenaDecision(side: ArenaSide, assetDisplay: string): string {
   switch (side) {
     case 'longOnly':
-      return `when to hold a long on ${asset}`;
+      return `when to hold a long on ${assetDisplay}`;
     case 'shortOnly':
-      return `when to hold a short on ${asset}`;
+      return `when to hold a short on ${assetDisplay}`;
     case 'follow':
     default:
-      return `when to go long or short on ${asset}`;
+      return `when to go long or short on ${assetDisplay}`;
   }
 }
